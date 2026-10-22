@@ -2281,15 +2281,18 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     const char* v = getenv("NI_VPF_MAX");
     return std::min(2047, v ? std::max(0, atoi(v)) : 128);
   }();
-  // one pass: 16 rows where the target verifies wide (two tiles read the weights once, ~90 ms at 16K either way),
-  // else 8 (encode_verify8's row capacity without a tree); NI_VPF_WIDE=0 keeps it at 8 on a wide target. The target's
-  // tables are never resized from here: NI_KFLASH/DFlash2 size them and read the same count back, and a target that
-  // holds 8 rows keeps the 8-row pass.
+  // one pass: the widest whole-tile count the target's verify holds (Qwen35::vpf_pass_rows: 32 on a dense target at
+  // the NI_VPF weight floor, else 8/16), as much of the suffix as fits in one weights read (~90 ms at 16K whether the
+  // pass is 16 or 32 rows); a pass of 8 where the target does not verify wide, which encode_verify8 always runs.
+  // NI_VPF_WIDE=0 keeps a wide target at 8 rows. The target's tables are sized at load from the same call, not here.
   static const bool vpf_wide = [] {
     const char* v = getenv("NI_VPF_WIDE");
     return !(v && v[0] == '0' && v[1] == 0);
   }();
-  const int vpf_pass = (vpf_wide && q35_ && q35_->verify_chain_ok(16)) ? 16 : 8;
+  // the pass width comes from Qwen35::pass_rows (Qwen35::vpf_pass_rows at load), not from the verify buffers' capacity:
+  // the drafter raises that capacity to its own drafting width, which is not what NI_VPF_ROWS asks for
+  const int vpf_cap = q35_ ? q35_->pass_rows() : 8;
+  const int vpf_pass = !vpf_wide || vpf_cap <= 8 ? 8 : vpf_cap;
   int vpf_samp = -1;  // the row of samples() that holds such a suffix's first token
   // The last two chunks' command buffers (committed): at most two chunks run ahead of the host, so a request that
   // arrives during a long prefill is seen within a chunk (encoding is far faster than the GPU: a 20K prompt's chunks
@@ -2311,7 +2314,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     }
     int T = prefill_chunk_rows(C, p, n, prefill_even_chunks() && !model_->ane_split_on());
     // NI_VPF: a request whose whole new suffix is a few rows over a long cached prefix (an agent turn) runs the
-    // suffix as verify passes: one pass per up to 16 rows (8 where the target verifies narrow), the sampler of the
+    // suffix as verify passes: one pass per up to 32 rows (16 or 8 where the target verifies narrow, NI_VPF_ROWS), the sampler of the
     // last row giving the reply's first token. Its rows are chain rows, exactly what the verify pass verifies, and
     // its GDN recurrent state is left pending (commit_rows) exactly as a decode cycle leaves the rows it accepted:
     // the first decoding pass folds them. The drafter's prefill capture hook is armed above and encodes these rows
@@ -2333,7 +2336,10 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
       const Qwen35Config& vcfg = q35_->config();
       vpf_scale = (long long)vcfg.hidden * vcfg.dense_I * vcfg.layers;
     }
-    const bool vpf_default = q35_ && !q35_->config().moe && vpf_scale >= 3000000000LL && q35_->verify_chain_ok(16);
+    // the measured case: a dense target at the weight floor whose drafter drafts a 16-row block (DFlash2). A dense
+    // target whose drafter drafts 8 rows keeps the prefill path, whatever capacity the pass sized for itself.
+    const bool vpf_default =
+        q35_ && !q35_->config().moe && vpf_scale >= 3000000000LL && q35_->drafter_wide() && q35_->verify_wide_ok();
     const bool vpf = vpf_on && q35_ && dfl_ && !lili_ && !spec_ && (vpf_forced || vpf_default) &&
                      p == start && p >= 1024 && T == n - p && n - p <= vpf_max && pbound <= p && !s.embeds &&
                      s.mask_rows == 0;
@@ -2362,11 +2368,17 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     }
     if (vpf) {
       int q = p;
-      // the suffix's rows [q, upto) as verify passes: 16 rows a pass where the target is wide, else 8
+      // the suffix's rows [q, upto) as verify passes: as many rows a pass as NI_VPF_ROWS gave the target's verify (32, 24
+      // or 16), and 8 for what is left under 16
       auto vpf_rows = [&](int upto) {
         while (q < upto) {
           const int left = upto - q;
-          const int R = (vpf_pass == 16 && left >= 16) ? 16 : std::min(8, left);
+          // the widest tile that fits (32, 24, 16: the ceiling of 32/24 and of 16/8), else the rows left when they are
+          // under 8: those run the tree-less 8-row verify, so a suffix never needs a partial tile
+          const int R = (vpf_pass >= 32 && left >= 32) ? 32
+                        : (vpf_pass >= 24 && left >= 24) ? 24
+                        : (vpf_pass >= 16 && left >= 16) ? 16
+                                                         : std::min(8, left);
           q35_->encode_verify_chain(*e, s, q, R, sp);
           q35_->commit_rows(s, R);
           vpf_samp = R - 1;  // the last pass's last row: the token after the prompt's last row
