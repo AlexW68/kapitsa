@@ -1068,7 +1068,9 @@ std::string find_harness() {
   else {
     const std::string exe = self_path();
     const std::string bin = exe.substr(0, exe.rfind('/'));
-    for (const char* rel : {"/../bench/harness", "/../../bench/harness", "/../share/kapitsa/bench/harness"})
+    // beside the binary (an unpacked release), where a checkout's build/ or an install keeps it
+    for (const char* rel : {"/bench/harness", "/../bench/harness", "/../../bench/harness",
+                            "/../share/kapitsa/bench/harness"})
       dirs.push_back(bin + rel);
     if (char cwd[PATH_MAX]; getcwd(cwd, sizeof cwd)) dirs.push_back(std::string(cwd) + "/bench/harness");
   }
@@ -1084,9 +1086,8 @@ int run_compare(int argc, char** argv, int first) {
   const std::string dir = find_harness();
   if (dir.empty()) {
     fprintf(stderr,
-            "kapitsa bench compare: the benchmark harness (bench/harness) was not found next to this kapitsa.\n"
-            "It is in the repository: git clone https://github.com/nace-ai/kapitsa, then run kapitsa from its build\n"
-            "folder, from the checkout, or with KAPITSA_HARNESS=<checkout>/bench/harness. Nothing is downloaded for you.\n");
+            "kapitsa bench compare: the benchmark harness (bench/harness) was not found beside this kapitsa; reinstall "
+            "it with install.sh or Homebrew (a release ships the harness), or set KAPITSA_HARNESS to another copy.\n");
     return 2;
   }
   const char* py = getenv("KAPITSA_PYTHON");
