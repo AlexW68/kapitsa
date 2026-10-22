@@ -362,14 +362,19 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       logi("DFlash2: %s does not fit this model's embedding / LM head format; not used", dir.c_str());
     } else {
       const size_t a0 = Gpu::get().allocated_bytes();
-      dfl_ = std::make_unique<DFlash2>(*q35_, dir);
+      // one slot: nothing decodes alongside a request, so a 16-row block's deeper lattice is free to take (with more
+      // slots a 16-row block has no batched cycle at all, Engine::batch_rows, and requests take turns instead)
+      const int block_rows = DFlash2::plan_block_rows(q35_->config(), opts_.slots, nullptr, DFlash2::tensor_path_ok());
+      const bool rows16 = block_rows > DFlash2::kB;
+      dfl_ = std::make_unique<DFlash2>(*q35_, dir, 0, rows16);
       dfl_dir_ = dir;
       DFlash2::prewarm_pipelines();
       spec_ = false;
       // the plan against what loading took (rings and the first prefill's buffers come later)
       size_t per_slot = 0, at_prefill = 0;
-      const size_t planned = DFlash2::plan_bytes(dir, q35_->config(), Qwen35::plan(opts_.model_dir, 1024).head_row_bytes,
-                                                 &per_slot, &at_prefill);
+      const size_t planned =
+          DFlash2::plan_bytes(dir, q35_->config(), Qwen35::plan(opts_.model_dir, 1024, rows16).head_row_bytes,
+                              &per_slot, &at_prefill, block_rows);
       logi("DFlash2: %.3f GB allocated at load (planned %.3f GB); %.3f GB more for %d slots' rings and %.3f GB at the "
            "first prefill", (Gpu::get().allocated_bytes() - a0) / 1e9, (planned - at_prefill - (size_t(4) << 20)) / 1e9,
            3.0 * per_slot * std::max(1, opts_.slots) / 1e9, std::max(1, opts_.slots), at_prefill / 1e9);
@@ -468,7 +473,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
                          : nh_ngram_ > 0 ? "prompt-lookup speculative decoding (up to " + std::to_string(nh_ngram_) +
                                                " drafts per cycle)"
                          : dfl_ && dfl_->tree() ? std::string("KFlash speculative decoding (DFlash2 lattice, tree verify)")
-                         : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(DFlash2::verify_depth()) + " of 7)"
+                         : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(dfl_->verify_depth()) + " of 7)"
                          : spec_ ? "MTP speculative decoding depth " + std::to_string(opts_.spec_depth)
                          : dory_spec_ > 0 ? "speculative decoding (" +
                                                     (dory_spec_kind() == "ngram"  ? std::string("prompt lookup")
@@ -512,7 +517,10 @@ size_t default_mem_budget() {
 
 MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
   // kept per process: a model's headers do not change while it is planned, and the largest take most of a second to
-  // read (Super-VL's), which the picker, `kapitsa doctor` and default_context would otherwise pay on every plan
+  // read (Super-VL's), which the picker, `kapitsa doctor` and default_context would otherwise pay on every plan.
+  // The plan is the 8-row one: the key has no slot count, so a 16-row block's rows (a drafter's verify buffers, ~30 MB
+  // on the 27B) are not in it. The picker is 0.07% of a 38 GB budget optimistic there; the engine's own load plans the
+  // block it will really use (DFlash2::plan_block_rows) and logs that against what loading takes.
   static std::mutex mu;
   static std::map<std::string, MemPlan> plans;
   const std::string key = model_dir + "\n" + std::to_string(prefill_chunk) + "\n" + std::to_string(Dory::serving_loops()) +
@@ -588,10 +596,12 @@ LoadPlan plan_load(const std::string& model_dir, const std::string& dflash, bool
       // auto: a drafter that would keep one conversation from its full context is left out (MTP or plain decoding
       // instead); the model with 1024-row prefill buffers, the slots' state, the Neural Engine split and one full
       // conversation come first
-      const Qwen35::MemPlan p = Qwen35::plan(model_dir, 1024);
+      const Qwen35Config dc = Qwen35::read_config(model_dir);
+      const int block_rows = DFlash2::plan_block_rows(dc, slots, nullptr, DFlash2::tensor_path_ok());
+      const Qwen35::MemPlan p = Qwen35::plan(model_dir, 1024, block_rows > DFlash2::kB);
       size_t per_slot = 0;  // the ring of the live state and of each of the slot's two checkpoints
       lp.dflash_bytes = lp.dflash_found_bytes =
-          DFlash2::plan_bytes(lp.dflash, Qwen35::read_config(model_dir), p.head_row_bytes, &per_slot) +
+          DFlash2::plan_bytes(lp.dflash, dc, p.head_row_bytes, &per_slot, nullptr, block_rows) +
           3 * per_slot * size_t(slots);
       if (lp.dflash_auto &&
           !conversation_fits(model_dir, context, slots, budget > lp.dflash_bytes ? budget - lp.dflash_bytes : 0)) {
@@ -895,7 +905,7 @@ int Engine::batch_rows(int n) const {
   if (mode == 0 || n < 2 || n > 8 || (!dfl_ && !lili_) || (mode < 0 && !batch_measured_)) return 0;
   // a 16-row drafting block has no batched cycle: it drafts a depth-15 lattice with the pair kernel, and the batch loop
   // drafts 7-token chains (encode_draft with tree = false), so the requests take turns instead
-  if (dfl_ && DFlash2::block() > DFlash2::kB) return 0;
+  if (dfl_ && dfl_->block() > DFlash2::kB) return 0;
   // NI_BATCH_ROWS="n:rows,...": rows per member for n members (0: take turns)
   static const std::vector<int> env = [] {
     std::vector<int> t(9, -1);
@@ -1095,7 +1105,7 @@ void Engine::batch_cycle(int rows) {
       Slot& sl = *j->slot;
       DFlashSeq& d = *sl.dseq;
       dfl_->stage_init(d);
-      if (d.staged > 0 && (k > 0 || d.staged == DFlash2::block())) dfl_->encode_commit_staged(*e1, d), e1_work = true;
+      if (d.staged > 0 && (k > 0 || d.staged == dfl_->block())) dfl_->encode_commit_staged(*e1, d), e1_work = true;
       if (k > 0) {
         const bool sampled = exact && j->sp.temperature > 0;
         dfl_->encode_draft(*e1, *sl.seq, d, j->P, sampled ? j->sp : greedy);
@@ -2546,13 +2556,13 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     // were verified unmasked); a second pass goes on from it, masked. In a batch (batch_cycle, batch_plain_run) the
     // runner computes the masked members' masks the same way, from their chains' drafts.
     DFlashSeq& d = *slot.dseq;
-    const int K = DFlash2::verify_depth();
+    const int K = dfl_->verify_depth();
     int P = n;
     req_cycles = 0;
     bool go = handle(s.tokens()[n]);
     // the KV room a cycle wants: the next anchor (at most P + 8) and its verify's rows (KFlash trees: up to 32; with
     // less room the drafting pass verifies fewer, DFlash2::tree_cap_)
-    const int Bk = DFlash2::block();  // the drafting block (8, or 16 rows: NI_DFLASH_BLOCK)
+    const int Bk = dfl_->block();  // the drafting block (8, or 16 rows: NI_DFLASH_BLOCK, or one slot's default)
     const int vrows = dfl_->tree() ? std::max(Bk, dfl_->tree_rows()) : Bk;
     for (;;) {
       int m = 0, a_last = 0;
