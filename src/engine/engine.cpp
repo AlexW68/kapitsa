@@ -1843,8 +1843,13 @@ Engine::Slot* Engine::pick_slot(const std::vector<int>& prompt, uint64_t arrival
     // the conversation in progress, however long an older one-off was, and a new conversation
     // replaces the conversation idle longest. A conversation whose request was still running when this
     // one arrived counts as continued: an agent sends its title request beside its first request
-    // (opencode does), and that first conversation goes on with the tools' results.
-    auto rank = [&](const Slot& s) { return s.tokens.empty() ? 0 : s.turns <= 1 && arrival > s.done_at ? 1 : 2; };
+    // (opencode does), and that first conversation goes on with the tools' results. A one-off is also a short
+    // conversation: one longer than 1024 tokens and four times this prompt is a main conversation's first turn that
+    // a short side request (a title, a summary) came after, and is not given up for it.
+    const size_t cheap = std::max<size_t>(1024, 4 * prompt.size());
+    auto rank = [&](const Slot& s) {
+      return s.tokens.empty() ? 0 : s.turns <= 1 && arrival > s.done_at && s.tokens.size() <= cheap ? 1 : 2;
+    };
     Slot* pick = nullptr;
     for (auto& s : slots_) {
       if (s.busy || int(prompt.size()) + 64 > s.seq->limit) continue;
@@ -2577,6 +2582,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   const double h_woke = Encoder::host_ms();
   res.prefill_ms = now_ms() - t0;
   res.prefill_exact = images.empty() && res.yields == 0;
+  if (res.prefill_exact) disk_note_prefill(n - start, res.prefill_ms);
   const std::string store_prompt = store_note(model_.get(), "prompt", n - start);
   // Neural Engine split: how busy the ANE was over the prefill. Near 100% it, not the GPU, is the bottleneck (a
   // smaller share would be faster: ane_calib --wave --write); the share is set for the GPU to be the bottleneck.
