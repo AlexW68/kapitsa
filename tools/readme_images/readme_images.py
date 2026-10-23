@@ -30,18 +30,22 @@ def fmt(v):
     return str(round(v)) if isinstance(v, (int, float)) else DASH
 
 
-NO_SPEC = "no spec"        # the record's method for plain decoding: shown as no label at all, on every engine
+NO_SPEC = "no spec"        # the record's method for plain decoding: shown as no label at all on a rival
+KAPITSA_METHOD = "KFlash"  # every Kapitsa cell's label: every Kapitsa decode path runs through KFlash
 
 
 def cell(row, engine):
-    """(value, method, raw) of one cell: value is a number, None (a dash) or "x" (can't run); method is None for plain
-    decoding (no speculative decoding), so a label only ever names a real method"""
+    """(value, method, raw) of one cell: value is a number, None (a dash) or "x" (can't run). A Kapitsa number's method
+    is always KFlash; a rival's is None for plain decoding (no speculative decoding), so a rival's label only ever names
+    a real method"""
     c = row["cells"].get(engine)
     if c is None or c == "x":
         return c, None, c
     if isinstance(c, (int, float)):
-        return c, None, c
+        return c, KAPITSA_METHOD if engine == "Kapitsa" else None, c
     m = c.get("method")
+    if engine == "Kapitsa" and is_num(c.get("value")):
+        return c.get("value"), KAPITSA_METHOD, c
     return c.get("value"), None if m == NO_SPEC else m, c
 
 
