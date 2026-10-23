@@ -466,6 +466,19 @@ KFlash is on by default for every block drafter. To compare it with the chain, o
 | `NI_KFLASH=0` (environment) | chains on every model |
 | `NI_DFLASH_TREE=0` (environment) | chains on the Qwen models only (overrides `NI_KFLASH` there) |
 | `--spec 0` (`kapitsa serve` option) | plain decoding, no drafter |
+| `NI_KFLASH_WRAP=0` (environment) | no KFlash label or accounting, and no prompt-lookup budget (also off by default, see below): prompt lookup verifies every draft it finds. Decoding is otherwise unchanged |
+| `NI_KFLASH_BUDGET=1` (environment) | the prompt-lookup budget (Nemotron Nano, Flint with `--spec`): a cycle verifies only the drafts that pay for their rows. Off by default, so prompt lookup verifies every draft as before; a pass of 2+ rows rounds differently from decode steps, so turning it on can change the text. `NI_KFLASH_ROW_COST=<steps>` sets the cost of an extra row (Flint 0.6, Nano 0.25 unmeasured) |
+
+Every decode runs as a KFlash cycle: the proposal source gives 0 or more guesses and the pass verifies the pending token plus
+the guesses the budget keeps. The source is a drafter (DFlash2, LiLiCorr, DSpark), the MTP head, prompt lookup, Dory's
+drafts, or none (a cycle of one row, which is plain decoding). The startup line ends with `KFlash (<source>)`, and each
+reply reports `usage.kapitsa.kflash` as `{"source": ..., "cycles": N}`.
+
+Prompt lookup (Nemotron Nano 4B by default, Flint with `NI_FLINT_NGRAM`) verifies every draft it finds. With
+`NI_KFLASH_BUDGET=1` it verifies only the drafts that pay for their rows (`src/model/kflash_wrap.h`): the acceptance of each
+draft position is counted per request, a row costs a fixed number of steps (Flint 0.6; Nano 0.25, not measured), and all the
+drafts are verified once in 16 cycles to keep the counts fresh. Plain decoding stays on its pipelined loop: sending it through a verify pass would make it slower, and Flint
+and the MTP models are bit-identical to their plain steps only on that loop.
 
 After each request, the server's log prints the budget: rows per cycle, the cycles at each tree size, the tokens per
 cycle it expected and got, the cost table and the calibration. Deleting its file in `~/.cache/kapitsa/kflash/` makes it

@@ -504,6 +504,15 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   // (NI_BATCH=1 batches them too)
   batch_measured_ = (dfl_ && !dfl_->config().v1) ||
                     (lili_ && std::string(lili_->name()) == "LiLiCorr" && nh_->iq2_experts());
+  if (kflash_budget_on() && (nh_ngram_ > 0 || flint_ngram_ > 0)) {
+    // what an extra row of a pass costs in decode steps (NI_KFLASH_ROW_COST overrides): Flint 0.6 (an M4 Pro: 2 / 4 / 8
+    // rows = 1.6 / 2.8 / 5.2 steps); Nemotron 0.25 is NOT measured here: calibrate it from the request log's "row x
+    // steps" line before relying on it
+    const char* v = getenv("NI_KFLASH_ROW_COST");
+    kf_row_cost_ = v && *v && atof(v) > 0 ? atof(v) : flint_ngram_ > 0 ? 0.6 : 0.25;
+    kf_lookup_k_ = std::max(nh_ngram_, flint_ngram_);
+    logi("KFlash: prompt-lookup budget on (extra row %.2f steps)", kf_row_cost_);
+  }
   const std::string mode = lili_ ? std::string(lili_->name()) + " speculative decoding (7-token blocks)"
                          : flint_ngram_ > 0 ? "prompt-lookup speculative decoding (up to " + std::to_string(flint_ngram_) +
                                                   " drafts per cycle)"
@@ -519,16 +528,31 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
                                                     ", " + (dory_spec_auto_ ? std::string("2-3") : std::to_string(dory_spec_)) +
                                                     " per cycle)"
                                  : std::string("plain decoding");
+  // KFlash wraps every decode (src/model/kflash_wrap.h): the source it takes proposals from is named in the line
+  const std::string kf_src = kflash_source();
   const std::string looped = dory_ ? ", " + std::to_string(dory_->default_loops()) + " loops by default (requests take 1-" +
                                          std::to_string(Dory::kMaxLoops) + "), " + loop_kv_name(dory_->kv_mode()) +
                                          " KV"
                                    : std::string();
-  logi("engine ready: %s, context %d, %d slots, %s%s%s", opts_.model_id.c_str(), opts_.context, std::max(1, opts_.slots),
-       mode.c_str(), looped.c_str(), vision_ ? ", images on" : "");
+  logi("engine ready: %s, context %d, %d slots, %s%s%s%s", opts_.model_id.c_str(), opts_.context, std::max(1, opts_.slots),
+       mode.c_str(), looped.c_str(), kf_src.empty() ? "" : (", KFlash (" + kf_src + ")").c_str(), vision_ ? ", images on" : "");
   disk_start();  // the SSD prefix cache (engine_disk.cpp): its files open in the background
 }
 
 Engine::~Engine() { save_disk_cache(); }
+
+// The proposal source KFlash takes rows from: a drafter model, the MTP head, prompt lookup, Dory's drafts, or none (a
+// cycle of 1 row: plain decoding). Empty with the wrapper off (NI_KFLASH=0 / NI_KFLASH_WRAP=0).
+std::string Engine::kflash_source() const {
+  if (!kflash_wrap_on()) return "";
+  if (lili_) return lili_->name();
+  if (dfl_) return "DFlash2";
+  if (flint_ngram_ > 0 || nh_ngram_ > 0) return "prompt lookup";
+  if (spec_) return "MTP";
+  if (dory_spec_ > 0)
+    return dory_spec_kind() == "ngram" ? "prompt lookup" : dory_spec_kind() == "self" ? "1-loop drafts" : "prompt lookup, 1-loop drafts";
+  return "none";
+}
 
 std::string Engine::lost() const { return model_->lost(); }
 
@@ -2759,7 +2783,13 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   int fed_until = n;  // exclusive: tokens whose effect is in the live state
   int req_cycles = 0;  // DFlash2 cycles of this request
   const int depth = spec_ ? opts_.spec_depth : 0;
-  auto cycle_done = [live](int m) {  // a decode cycle wrote m tokens (for a display)
+  KfWrap kfw;  // this request's KFlash: its decode loop asks it for the rows of a cycle and tells it what the cycle wrote
+  kfw.source = kflash_source();
+  if (kf_lookup_k_ > 0) kfw.lookup.emplace(kf_lookup_k_, kf_row_cost_);  // (per request: the rows are a function of its own tokens)
+  int kf_rows = 1;  // rows of the cycle in flight (cycle_done's report)
+  auto cycle_done = [live, &kfw, &kf_rows](int m) {  // a decode cycle wrote m tokens (for a display)
+    kfw.cycle(m, kf_rows);
+    kf_rows = 1;
     if (!live) return;
     live->last.store(m, std::memory_order_relaxed);
     live->cycles.fetch_add(1, std::memory_order_relaxed);
@@ -3220,6 +3250,9 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       }
       if (mtp_e) mtp_e->wait();  // (nothing reads the token buffer before the drafts are written)
       ngram_drafts(s.tokens(), P, nh_ngram_, nd);
+      kf_rows = kfw.plan(int(nd.size()));  // KFlash's budget: the pending token's row and the drafts worth theirs
+      nd.resize(size_t(kf_rows - 1));
+      const double kf_t0 = now_ms();
       int* tw = s.tokens();
       for (size_t j = 0; j < nd.size(); ++j) tw[P + 1 + int(j)] = nd[j];
       const int R = int(nd.size()) + 1;
@@ -3228,6 +3261,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       nh_->encode_accept(*e2, s, P, R, R - 1, sp);
       e2->commit_and_wait();
       const int a = nh_->accepted();
+      kfw.observe(int(nd.size()), a, now_ms() - kf_t0);
       const int* tk = s.tokens();
       int m = 0;
       while (m < a + 1) {
@@ -3272,6 +3306,9 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       }
       if (mtp_e) mtp_e->wait();  // (nothing reads the token buffer before the drafts are written)
       ngram_drafts(s.tokens(), P, flint_ngram_, nd);
+      kf_rows = kfw.plan(int(nd.size()));  // KFlash's budget: the pending token's row and the drafts worth theirs
+      nd.resize(size_t(kf_rows - 1));
+      const double kf_t0 = now_ms();
       int* tw = s.tokens();
       for (size_t j = 0; j < nd.size(); ++j) tw[P + 1 + int(j)] = nd[j];
       const int R = int(nd.size()) + 1;
@@ -3280,6 +3317,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       flint_->encode_accept(*e2, s, P, R, R - 1, sp);
       e2->commit_and_wait();
       const int a = flint_->accepted();
+      kfw.observe(int(nd.size()), a, now_ms() - kf_t0);
       const int* tk = s.tokens();
       int m = 0;
       while (m < a + 1) {
@@ -3394,6 +3432,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         park();
         yield_turn(res);
       }
+      kf_rows = kfw.plan(0);  // KFlash's budget with no proposals: the pending token's row alone, this step (so plain decoding is as before)
       // the step feeding token `pos` is in flight; queue the one after it, then wait
       auto cur = std::move(next);
       next = encode_at(pos + 1);
@@ -3528,6 +3567,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   slot.tokens.assign(s.tokens(), s.tokens() + fed_until);
   if (mmp) std::copy(keys.begin(), keys.end(), slot.tokens.begin());  // image rows: their keys
   res.completion_tokens = gen;
+  res.kflash_source = kfw.source;
+  res.kflash_cycles = int(kfw.cycles);
   if ((dfl_ || lili_) && spec_cycles_ > 0)
     logd("%s: %.2f tokens/cycle over %ld cycles", lili_ ? lili_->name() : "dflash", double(spec_accepted_) / spec_cycles_,
          spec_cycles_);
@@ -3554,9 +3595,21 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   disk_filled(slot, start, fed_until);
   slot.live_ok = finish == "tool_calls";
   ++slot.version;  // (a state the SSD prefix cache does not have yet)
-  char cyc[64] = "";
+  char cyc[192] = "";
   if ((dfl_ || lili_ || dory_spec_ || nh_ngram_ || flint_ngram_) && req_cycles > 0)
     snprintf(cyc, sizeof cyc, ", %.2f tok/cycle", double(gen - 1) / req_cycles);
+  if (kfw.cycles > 0 && !kfw.source.empty()) {  // (not with the wrapper off) KFlash's account of the request: rows verified, and the drafts among them that were accepted
+    const size_t n0 = strlen(cyc);
+    if (kfw.planned > 0)  // (rows only where KFlash's plan() chose them: a drafter's or MTP's cycle verifies several, counted elsewhere)
+      snprintf(cyc + n0, sizeof cyc - n0, ", KFlash (%s): %ld cycles, %ld rows, %ld drafts accepted", kfw.source.c_str(), kfw.cycles,
+               kfw.rows, kfw.tokens - kfw.cycles);
+    else
+      snprintf(cyc + n0, sizeof cyc - n0, ", KFlash (%s): %ld cycles", kfw.source.c_str(), kfw.cycles);
+  }
+  if (kfw.lookup && kfw.lookup->c1() > 0 && kfw.lookup->s() > 0) {  // the measured row cost, to calibrate NI_KFLASH_ROW_COST
+    const size_t n0 = strlen(cyc);
+    snprintf(cyc + n0, sizeof cyc - n0, ", row %.2f steps (budget %.2f)", kfw.lookup->s() / kfw.lookup->c1(), kfw.lookup->row_cost());
+  }
   // requests in flight at once: the slot, the wait for it, the turns given to the others (prefill, decode)
   char conc[256] = "";
   if (res.yields > 0 || res.queue_ms > 0 || res.batched > 0)

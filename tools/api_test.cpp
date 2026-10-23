@@ -19,6 +19,7 @@
 #include "engine/output_parser.h"
 #include "engine/disk_wait.h"
 #include "engine/reasoning_memory.h"
+#include "model/kflash_wrap.h"
 #include "tokenizer/tokenizer.h"
 
 #include <minja/chat-template.hpp>
@@ -1070,6 +1071,91 @@ void reasoning_memory(const TmplModel& m, const std::string& tag) {
         tag + "reasoning memory: a turn the server did not write gets no reasoning");
 }
 
+// KFlash around prompt lookup (src/model/kflash_wrap.h): the budget verifies the source's drafts until it has measured,
+// then only as many as pay for their rows
+void kflash_lookup_unit() {
+  KfWrap w;
+  w.cycle(1), w.cycle(3, 4);
+  check(w.cycles == 2 && w.tokens == 4 && w.rows == 5 && w.tokens_per_cycle() == 2.0 && w.source == "none",
+        "kflash wrap: counts cycles, tokens and rows");
+  check(w.plan(0) == 1 && w.plan(3) == 4, "kflash wrap: with no budget a cycle verifies the source's proposals (none: 1 row, the plain step)");
+  {  // through a lookup budget: unmeasured it takes the proposals, rejected ones stop being verified
+    KfWrap x;
+    x.lookup.emplace(4, 0.6);
+    check(x.plan(0) == 1 && x.plan(3) == 4, "kflash wrap: a lookup budget unmeasured takes the proposals");
+    for (int i = 0; i < 40; ++i) x.observe(4, 0, 16.0);
+    int one = 0;
+    for (int i = 0; i < 64; ++i) one += x.plan(4) == 1;
+    check(one >= 58 && one < 64, "kflash wrap: rejected proposals are 1 row, bar the periodic probe", std::to_string(one));
+  }
+  {  // unmeasured: the source's own count, never more than it proposed
+    KfLookup b(4, 0.6);
+    check(b.pick(0) == 0 && b.pick(3) == 3 && b.pick(9) == 4, "kflash lookup: unmeasured, takes the source's count up to its maximum");
+  }
+  {  // drafts always accepted: most of them (an extra row at 0.6 steps still pays; the 1% margin keeps a shorter pass on a tie)
+    KfLookup b(4, 0.6);
+    for (int i = 0; i < 20; ++i) b.observe(4, 4, 11.0);
+    int small = 0;
+    for (int i = 0; i < 63; ++i) small += b.pick(4) < 3;
+    check(small == 0, "kflash lookup: accepted drafts are verified");
+  }
+  {  // no clock in the choice: the same cycles give the same rows whatever the cycles took
+    KfLookup a(4, 0.6), b(4, 0.6);
+    bool same = true;
+    for (int i = 0; i < 200; ++i) {
+      const int da = a.pick(4), db = b.pick(4);
+      same = same && da == db;
+      const int acc = i % 3 == 0 ? da : 0;
+      a.observe(da, acc, 10.0 + i % 7);
+      b.observe(db, acc, 3.0 + 40.0 * (i % 5));
+    }
+    check(same, "kflash lookup: the rows of a cycle do not depend on the time the cycles took");
+  }
+  {  // drafts never accepted and rows costly: the pending token alone, except the periodic probe
+    KfLookup b(4, 0.6);
+    for (int i = 0; i < 20; ++i) b.observe(4, 0, 16.0);
+    int zero = 0, full = 0;
+    for (int i = 0; i < 128; ++i) (b.pick(4) == 0 ? zero : full)++;
+    check(zero >= 116 && full >= 4 && full <= 12, "kflash lookup: rejected drafts are skipped, one cycle in 16 probes", std::to_string(full));
+  }
+  {  // two of four accepted: p(1) = p(2) = 0.97, p(3) = 0.03, so 3 rows (d = 2) win: 2.9 tokens for 2.2 steps, against 1.97 for
+     // d = 1 and 3.0 for 3.4 steps at d = 4
+    KfLookup b(4, 0.6);
+    for (int i = 0; i < 40; ++i) b.observe(4, 2, 11.0);
+    const int d = b.pick(4);
+    check(d == 2, "kflash lookup: a partly accepted draft is budgeted at the count that pays", std::to_string(d));
+  }
+  {  // a request's budget starts fresh: the same cycles give the same rows after a request that left it skipping
+    KfWrap first, second;
+    first.lookup.emplace(4, 0.6);
+    for (int i = 0; i < 80; ++i) first.observe(4, 0, 16.0), first.plan(4);
+    second.lookup.emplace(4, 0.6);
+    KfWrap third;
+    third.lookup.emplace(4, 0.6);
+    const bool starts_full = second.plan(4) == 5 && third.plan(4) == 5;  // (the source's own count: 4 drafts and the pending row)
+    bool same = true;
+    for (int i = 0; i < 100; ++i) {
+      const int a = second.plan(4), c = third.plan(4);
+      same = same && a == c;
+      second.observe(a - 1, i % 2 ? a - 1 : 0, 11.0), third.observe(c - 1, i % 2 ? c - 1 : 0, 11.0);
+    }
+    check(same && starts_full, "kflash lookup: a request's budget is its own: it starts with the source's count");
+  }
+  {  // the regime changes (prose, then a copy): the budget skipped, then probed, accepted and re-enabled
+    KfLookup b(4, 0.6);
+    for (int i = 0; i < 40; ++i) b.observe(4, 0, 16.0);
+    int back = -1, run = 0;
+    for (int i = 0; i < 1000 && back < 0; ++i) {
+      const int d = b.pick(4);
+      if (d == 0) b.observe(0, 0, 10.0);
+      else b.observe(d, d, 11.0);
+      run = d >= 1 ? run + 1 : 0;
+      if (run >= 4) back = i;
+    }
+    check(back >= 0 && back <= 400, "kflash lookup: accepted probes re-enable the drafts within 400 cycles", std::to_string(back));
+  }
+}
+
 // A float tool argument keeps its text through the Qwen3.5 / Nemotron templates' `| string` (without a model folder: a
 // minimal template with their argument line, so CI runs it).
 // Engine::disk_lookup's wait for a conversation's SSD copy still being written: bounded by the write and by the prefill
@@ -1404,6 +1490,7 @@ int main(int argc, char** argv) {
   reasoning_memory_unit();
   float_arguments_text();
   disk_wait_unit();
+  kflash_lookup_unit();
   std::vector<std::string> dirs;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump_cases(argv[++i]);
