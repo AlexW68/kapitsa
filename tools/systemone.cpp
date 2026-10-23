@@ -362,7 +362,6 @@ class SystemOne {
     ojson out = ni::systemone::format_answers(logits, enc.meta);
     tm->head_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
     scored_input_tokens_ = (int) enc.total_tokens();
-    input_tokens_ = scored_input_tokens_;
     return out;
   }
 
@@ -389,6 +388,7 @@ class SystemOne {
       }
     } else {
       answers = score(body, &tm);
+      input_tokens_ = scored_input_tokens_;
       output_tokens = ni::systemone::output_tokens(tok_, answers);
     }
     const auto ms = [](double v) { return std::round(v * 100.0) / 100.0; };
@@ -515,6 +515,14 @@ class SystemOne {
 };
 
 ojson parse_body(const std::string& body) {
+  // The parser recurses once per container level and nlohmann has no depth bound of its own: the server parses on
+  // httplib worker threads, whose stacks are far smaller than the main thread's, so a deep body overflows them (a
+  // 4,000-deep state killed the process with SIGBUS before the renderer's own bound could answer 400). Reject past the
+  // bound here, before the parser runs, with the renderer's message; --encode and the server share this path.
+  if (ni::systemone::request_depth(body) > ni::systemone::kMaxRenderDepth) {
+    throw ni::systemone::BadRequest("the request nests values more than " +
+                                    std::to_string(ni::systemone::kMaxRenderDepth) + " levels deep");
+  }
   try {
     return ojson::parse(body);
   } catch (const std::exception& e) {

@@ -44,7 +44,7 @@ questions. A question is one of three types:
 The reply is `{model, answers, usage: {input_tokens, input_tokens_details: {cached_tokens}, output_tokens}, latency_ms, timings}`; probabilities are rounded to
 four decimals, `confidence` is the separation of the best option from a flat distribution, and `output_tokens`
 counts the tokens of the answer JSON, as in the reference server. A `{"requests": [...]}` list scores up to 1024
-states in one call with one model in memory.
+states in one call with one model in memory, and its `usage` sums the elements'.
 
 ## How it runs on Kapitsa
 
@@ -98,6 +98,11 @@ many positions came from the cache (0: the request prefilled its state), under `
 `SYSTEMONE_CONTEXT` sets all three caps at once; a specific variable overrides its own cap. A request that does
 not fit is rejected with 400 and a message that says which limit it hit, before any GPU work starts. The context
 can be raised to 131072 if the Mac has the memory for the KV cache.
+
+A request's JSON may nest at most 64 levels (`kMaxRenderDepth`, which both the renderer and the parser's guard
+count), and the bound counts the whole body: the request object is one level, so a state nested 63 deep is the
+limit, and a `{"requests": [element]}` element has two levels fewer (a state nested 61 deep). A deeper body is a
+400 that names the limit instead of a stack overflow.
 
 `--once request.json --repeat 5 --warmup 1` scores one request from a file and prints the measured latencies, which
 is how the numbers below were taken. `--encode request.json` needs no GPU at all: with only the tokenizer loaded it
