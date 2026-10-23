@@ -2259,9 +2259,11 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   // ~7.6 ms a row. The rows are a chain, which is exactly what a verify pass verifies (row t at position pos + t,
   // its state its predecessors' fold), so a cached turn's suffix is the work of a draft cycle's verify.
   // NI_VPF=0 turns it off; NI_VPF_MAX (default 64) bounds the suffix's rows. Gated on a request that is nothing
-  // but such a suffix: one chunk, no prefix checkpoint inside it, no grammar mask, no image rows. The turn
-  // boundary's checkpoint (which the plain path saves when its chunk reaches it) is saved here between two passes,
-  // with the state folded up to it, so a suffix that holds the boundary is fine.
+  // but such a suffix: one chunk, no prefix checkpoint inside it, no grammar mask, no image rows. A turn boundary
+  // inside the suffix needs the state folded up to that row for its checkpoint (the plain path takes the same
+  // checkpoint from its chunk's snapshot, for free), so the fold is a pass the passes mode pays and the short ones
+  // cannot afford: NI_VPF_SPLIT_MIN (default 25) hands a suffix that holds a boundary and is shorter than that
+  // back to the plain path.
   static const bool vpf_on = [] {
     const char* v = getenv("NI_VPF");
     return !(v && v[0] == '0' && v[1] == 0);
@@ -2284,6 +2286,24 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   static const int vpf_max = [] {
     const char* v = getenv("NI_VPF_MAX");
     return std::min(2047, v ? std::max(0, atoi(v)) : 64);
+  }();
+  // A turn boundary inside the suffix costs a fold (encode_flush) up to that row so the checkpoint's state is
+  // material, and the plain path gets the same checkpoint for free from its chunk's snapshot hook. The fold is a
+  // whole weights pass (~70 ms at a 16K prefix), so on a suffix short enough that the passes' saving does not cover
+  // it the plain
+  // path is faster, and the plain path's own cost steps up as its small-T passes gain a pass. Measured on this M5
+  // Pro at a 16K cached prefix, two interleaved legs a setting, the boundary inside the suffix: 21 rows 209/209 ms on
+  // the prefill path against 169/169 as passes, 24 rows 214/214 against 237/236, 25 rows 266/266 against 237/235, 26
+  // rows 266/268 against 237/238, 30 rows 269/269 against 280/280, 38 rows 339/339 against 290/290. The crossover
+  // is between 24 and 25 rows, so NI_VPF_SPLIT_MIN is 25: a shorter suffix holding a boundary takes the plain path,
+  // a longer one the passes. The fallback is the path the request took before the passes existed, so it cannot be
+  // slower than it; a suffix without a boundary inside is unaffected at any length. Rows alone do not decide it - the
+  // fold splits the suffix into two pass-quantised pieces, so where the boundary sits matters too, and the one size
+  // measured above the crossover where the passes lose is 30 rows (280/280 against 269/269 on the plain path, the
+  // tail after its fold just passing a pass boundary), which a row threshold cannot express.
+  static const int vpf_split_min = [] {
+    const char* v = getenv("NI_VPF_SPLIT_MIN");
+    return v ? std::max(0, atoi(v)) : 25;
   }();
   // one pass: the widest whole-tile count the target's verify holds (Qwen35::vpf_pass_rows: 32 on a dense target at
   // the NI_VPF weight floor, else 8/16), as much of the suffix as fits in one weights read (~90 ms at 16K whether the
@@ -2356,9 +2376,12 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     // target whose drafter drafts 8 rows keeps the prefill path, whatever capacity the pass sized for itself.
     const bool vpf_default =
         q35_ && !q35_->config().moe && vpf_scale >= 3000000000LL && q35_->drafter_wide() && q35_->verify_wide_ok();
+    // a boundary inside the suffix makes the passes fold at it for the checkpoint; under vpf_split_min rows that
+    // fold costs more than the passes save, so the plain path (which snapshots the checkpoint mid-chunk) keeps it
+    const bool vpf_split = boundary > p && boundary < n && n - p < vpf_split_min;
     const bool vpf = vpf_on && q35_ && dfl_ && !lili_ && !spec_ && (vpf_forced || vpf_default) &&
                      p == start && p >= 1024 && T == n - p && n - p <= vpf_max && pbound <= p && !s.embeds &&
-                     s.mask_rows == 0;
+                     s.mask_rows == 0 && !vpf_split;
     Checkpoint* snap = nullptr;
     int snap_at = boundary;
     if (pbound > p && pbound < p + T) {
