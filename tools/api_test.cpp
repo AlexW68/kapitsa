@@ -15,6 +15,7 @@
 #include "api/clients.h"
 #include "api/responses.h"
 #include "engine/output_parser.h"
+#include "engine/reasoning_memory.h"
 #include "tokenizer/tokenizer.h"
 
 #include <minja/chat-template.hpp>
@@ -930,6 +931,142 @@ void responses_round_trip(const TmplModel& m, const std::string& tag, bool drop_
   }
 }
 
+// The reasoning memory without a model (this runs in CI): which turn gets which reasoning back, and what it never touches.
+void reasoning_memory_unit() {
+  using Calls = std::vector<std::pair<std::string, std::string>>;
+  const Calls ls = {{"bash", R"({"command":"ls","cwd":"/a"})"}};
+  auto turn = [](const char* content, const Calls& calls, const char* args_text = nullptr) {
+    ojson tcs = ojson::array();
+    for (auto& [name, args] : calls)
+      tcs.push_back({{"id", "call_x"}, {"type", "function"},
+                     {"function", {{"name", name}, {"arguments", args_text ? ojson(std::string(args_text)) : ojson::parse(args)}}}});
+    ojson m = {{"role", "assistant"}, {"content", content}};
+    if (!calls.empty()) m["tool_calls"] = tcs;
+    return m;
+  };
+  const ojson sys = J(R"({"role": "system", "content": "S"})");
+  const ojson ua = J(R"({"role": "user", "content": "task A"})"), ub = J(R"({"role": "user", "content": "task B"})");
+  const ojson tool = J(R"({"role": "tool", "tool_call_id": "call_x", "content": "ok"})");
+  auto msgs = [](std::initializer_list<ojson> l) { return ojson(std::vector<ojson>(l)); };
+  ReasoningMemory mem;
+  // two sessions end a step with the same call and no text: each gets its own reasoning back
+  mem.remember(msgs({sys, ua}), "", ls, "thinking of A");
+  mem.remember(msgs({sys, ub}), "", ls, "thinking of B");
+  ojson a = msgs({sys, ua, turn("", ls), tool}), b = msgs({sys, ub, turn("", ls), tool});
+  check(mem.restore(a) == 1 && mem.restore(b) == 1 && a[2]["reasoning_content"] == "thinking of A" &&
+            b[2]["reasoning_content"] == "thinking of B",
+        "reasoning memory: two conversations with the same turn text each get their own reasoning back");
+  ojson c = msgs({sys, J(R"({"role": "user", "content": "task C"})"), turn("", ls), tool});
+  check(mem.restore(c) == 0 && !c[2].contains("reasoning_content"), "reasoning memory: the same turn after another history gets nothing");
+  // a turn's text with the separators a naive key would use cannot collide with a call
+  mem.remember(msgs({sys, ua}), "Done.", {}, "answer reasoning");
+  ojson d = msgs({sys, ua, turn("Done.", {})});
+  ojson e = msgs({sys, ua, turn("Done.\x01x\x02y", {})});
+  check(mem.restore(d) == 1 && mem.restore(e) == 0, "reasoning memory: a final answer is found by its text; other text is not");
+  // the client's own reasoning stays; client ids and key order do not matter; arguments come back as written
+  ojson f = msgs({sys, ua, turn("", ls), tool});
+  f[2]["reasoning_content"] = "client's";
+  check(mem.restore(f) == 0 && f[2]["reasoning_content"] == "client's", "reasoning memory: a client's own reasoning is never replaced");
+  ojson g = msgs({sys, ua, turn("", ls, R"({"cwd":"/a","command":"ls"})"), tool});
+  g[2]["tool_calls"][0]["id"] = "other";
+  check(mem.restore(g) == 1 && g[2]["tool_calls"][0]["function"]["arguments"].get<std::string>() == R"({"command":"ls","cwd":"/a"})",
+        "reasoning memory: another key order and tool-call id match; the arguments are put back in the model's order");
+  ojson g2 = msgs({sys, ua, turn("", ls), tool});
+  g2[2]["tool_calls"][0]["function"]["arguments"] = ojson::parse(R"({"cwd":"/a","command":"ls"})");
+  check(mem.restore(g2) == 1 && g2[2]["tool_calls"][0]["function"]["arguments"].dump() == R"({"command":"ls","cwd":"/a"})",
+        "reasoning memory: arguments sent as an object come back in the model's key order");
+  // a client that rewrote an earlier message gets nothing (the old behaviour)
+  ojson h = msgs({sys, J(R"j({"role": "user", "content": "task A (edited)"})j"), turn("", ls), tool});
+  check(mem.restore(h) == 0, "reasoning memory: a changed earlier message means no match");
+  // arguments nested far deeper than any call: no recursion over them, no match
+  std::string deep(5000, '[');
+  deep += std::string(5000, ']');
+  const Calls dc = {{"f", "{\"x\":" + deep + "}"}};
+  mem.remember(msgs({sys, ua}), "", dc, "never kept");
+  ojson dd = msgs({sys, ua, turn("", dc), tool});
+  check(mem.restore(dd) == 0, "reasoning memory: arguments nested too deep are never matched (and never recursed over)");
+  // a size mismatch in tool_calls leaves the arguments alone
+  ojson k = msgs({sys, ua, turn("", ls), tool});
+  k[2]["tool_calls"].push_back(k[2]["tool_calls"][0]);
+  check(mem.restore(k) == 0, "reasoning memory: a turn with other calls than the remembered one gets nothing");
+  // bounded: the oldest turns go first
+  ReasoningMemory small;
+  for (size_t i = 0; i < ReasoningMemory::kMaxEntries + 40; ++i)
+    small.remember(msgs({sys, J(R"({"role": "user", "content": "q"})"), turn(("t" + std::to_string(i)).c_str(), {})}), "x", {}, "r");
+  check(small.size() == ReasoningMemory::kMaxEntries, "reasoning memory: at most 512 turns are kept");
+  ReasoningMemory big;
+  for (int i = 0; i < 40; ++i) big.remember(msgs({sys, ua}), "turn " + std::to_string(i), {}, std::string(1 << 20, 'r'));
+  check(big.size() <= 16 && big.size() >= 14, "reasoning memory: at most 16 MB of reasoning are kept", std::to_string(big.size()));
+  // off by the environment
+  setenv("NI_REASONING_MEMORY", "0", 1);
+  ojson o = msgs({sys, ua, turn("", ls), tool});
+  check(mem.restore(o) == 0, "reasoning memory: NI_REASONING_MEMORY=0 puts nothing back");
+  ReasoningMemory off;
+  off.remember(msgs({sys, ua}), "", ls, "r");
+  unsetenv("NI_REASONING_MEMORY");
+  check(off.size() == 0, "reasoning memory: NI_REASONING_MEMORY=0 remembers nothing");
+}
+
+// A chat-completions client that drops reasoning_content (or names it otherwise) in a tool loop: the template renders
+// an empty think block where the live state holds the reasoning, and the next prompt diverges at that turn. With the
+// server's reasoning memory the same request renders as the client that echoes it (the prompt continues the generated
+// turn token for token); a client's own reasoning is never replaced.
+void reasoning_memory(const TmplModel& m, const std::string& tag) {
+  const ojson tools = J(R"([{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object",
+    "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}}}}])");
+  ChatRequest q1;
+  q1.messages = J(R"([{"role": "system", "content": "S"}, {"role": "user", "content": "Q"}])");
+  q1.tools = tools;
+  const std::string p1 = render_chat(*m.tmpl, q1, true);
+  std::vector<int> g1;
+  const std::string gen1 = "I should read the file first, then answer.\n</think>\n\nReading it.\n\n<tool_call>\n<function=f>\n"
+                           "<parameter=path>\nsrc/a.py\n</parameter>\n<parameter=limit>\n10\n</parameter>\n</function>\n</tool_call>";
+  auto d1 = generate(m, gen1, true, tools, &g1);
+  const ChatResult res = finished(d1, int(g1.size()));
+  ReasoningMemory mem;
+  std::vector<std::pair<std::string, std::string>> calls;
+  for (auto& tc : res.tool_calls) calls.emplace_back(tc.name, tc.arguments);
+  mem.remember(q1.messages, res.content, calls, res.reasoning);
+  ojson tcs = ojson::array();
+  for (auto& tc : res.tool_calls)
+    tcs.push_back({{"id", tc.id}, {"type", "function"}, {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}});
+  const ojson tool = {{"role", "tool"}, {"tool_call_id", res.tool_calls.empty() ? "" : res.tool_calls[0].id}, {"content", "ok"}};
+  auto next = [&](const ojson& assistant) {
+    ChatRequest q2 = q1;
+    q2.messages.push_back(assistant);
+    q2.messages.push_back(tool);
+    for (auto& mm : q2.messages)  // normalize_messages
+      if (mm.contains("tool_calls"))
+        for (auto& tc : mm["tool_calls"])
+          if (tc["function"]["arguments"].is_string()) tc["function"]["arguments"] = ojson::parse(tc["function"]["arguments"].get<std::string>());
+    return q2;
+  };
+  std::string why;
+  ojson plain = {{"role", "assistant"}, {"content", res.content}, {"tool_calls", tcs}};  // no reasoning at all
+  ChatRequest q2 = next(plain);
+  check(!continues(m, p1, g1, render_chat(*m.tmpl, q2, true), &why),
+        tag + "reasoning memory: a client that drops the reasoning diverges at that turn (without the memory)");
+  check(res.reasoning.size() > 5 && mem.restore(q2.messages) == 1 && continues(m, p1, g1, render_chat(*m.tmpl, q2, true), &why),
+        tag + "reasoning memory: the dropped reasoning is put back, the next prompt continues the generated turn token for token", why);
+  // the client re-serialized the arguments (another key order, compact text): the same turn
+  ojson reordered = tcs;
+  reordered[0]["function"]["arguments"] = R"({"limit":10,"path":"src/a.py"})";
+  q2 = next({{"role", "assistant"}, {"content", res.content}, {"tool_calls", reordered}});
+  check(mem.restore(q2.messages) == 1 && continues(m, p1, g1, render_chat(*m.tmpl, q2, true), &why),
+        tag + "reasoning memory: found again when the client wrote the arguments in another key order", why);
+  // reasoning the client sent stays; a turn the server did not write (other content) gets nothing
+  ojson own = plain;
+  own["reasoning_content"] = "the client's own";
+  q2 = next(own);
+  check(mem.restore(q2.messages) == 0 && q2.messages[2]["reasoning_content"] == "the client's own",
+        tag + "reasoning memory: a client's own reasoning is never replaced");
+  ojson other = plain;
+  other["content"] = "Something else.";
+  q2 = next(other);
+  check(mem.restore(q2.messages) == 0 && !q2.messages[2].contains("reasoning_content"),
+        tag + "reasoning memory: a turn the server did not write gets no reasoning");
+}
+
 void template_checks(const TmplModel& m, const std::string& tag) {
   // a later system message is a system turn in place; images become a note; the template no longer raises
   ChatRequest r;
@@ -1064,6 +1201,7 @@ int main(int argc, char** argv) {
   responses_events();
   chat_events();
   clients();
+  reasoning_memory_unit();
   std::vector<std::string> dirs;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--dump" && i + 1 < argc) dump_cases(argv[++i]);
@@ -1083,6 +1221,7 @@ int main(int argc, char** argv) {
     m.tmpl = std::make_unique<minja::chat_template>(chat_template_source(dir), "", "<|im_end|>");
     const std::string tag = "[" + dir.substr(dir.find_last_of('/') + 1) + "] ";
     anthropic_round_trip(m, tag);
+    reasoning_memory(m, tag);
     responses_round_trip(m, tag, false);
     responses_round_trip(m, tag, true);
     template_checks(m, tag);
