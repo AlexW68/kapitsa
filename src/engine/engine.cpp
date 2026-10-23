@@ -2258,7 +2258,7 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
   // 210 vs 53-115 GB/s): a 16-row pass costs ~90 ms at a 16K prefix, where the prefill path costs ~120 ms plus
   // ~7.6 ms a row. The rows are a chain, which is exactly what a verify pass verifies (row t at position pos + t,
   // its state its predecessors' fold), so a cached turn's suffix is the work of a draft cycle's verify.
-  // NI_VPF=0 turns it off; NI_VPF_MAX (default 128) bounds the suffix's rows. Gated on a request that is nothing
+  // NI_VPF=0 turns it off; NI_VPF_MAX (default 64) bounds the suffix's rows. Gated on a request that is nothing
   // but such a suffix: one chunk, no prefix checkpoint inside it, no grammar mask, no image rows. The turn
   // boundary's checkpoint (which the plain path saves when its chunk reaches it) is saved here between two passes,
   // with the state folded up to it, so a suffix that holds the boundary is fine.
@@ -2274,12 +2274,16 @@ ChatResult Engine::chat(const ChatRequest& r, const std::function<bool(const Cha
     return v && v[0] == '1' && v[1] == 0;
   }();
   // DFlash2's prompt-capture hook covers the last 2047 rows of the prompt (kCtxKeep), and a wide pass whose first
-  // row lies below it is a fatal: a longer suffix must not enter this path. The 128-row default is the longest
-  // measured suffix: 116 rows at a 16K prefix costs 757 ms as verify passes against 994 ms on the prefill path
-  // (64 rows 491 against 527), and the pass keeps winning there, so the older 64-row cap was leaving 24% on the table
+  // row lies below it is a fatal: a longer suffix must not enter this path. The cap is where the prefill path stops
+  // being the slower one: it used to be 128 rows on the measurement "116 rows at a 16K prefix costs 757 ms as verify
+  // passes against 994 ms on the prefill path (64 rows 491 against 527)", but that prefill number was the
+  // short-prefill families', and a 64..128-row chunk takes the tensor-op GEMM now (Qwen35::sp_qmt_pref): at a 16K
+  // prefix a 73-row suffix costs 434/433 ms as passes against 373/379 ms on the prefill path, a 124-row one 665/673
+  // against 442/452. Below the boundary it is the other way round, and 47 and 55 rows still take the staged GEMMs
+  // (447 and 484 ms on the prefill path against 399 and 378 as passes), so the cap is 64, the short-prefill boundary
   static const int vpf_max = [] {
     const char* v = getenv("NI_VPF_MAX");
-    return std::min(2047, v ? std::max(0, atoi(v)) : 128);
+    return std::min(2047, v ? std::max(0, atoi(v)) : 64);
   }();
   // one pass: the widest whole-tile count the target's verify holds (Qwen35::vpf_pass_rows: 32 on a dense target at
   // the NI_VPF weight floor, else 8/16), as much of the suffix as fits in one weights read (~90 ms at 16K whether the
